@@ -8,10 +8,11 @@ use ignition_config::v3_6::{Config, Resource as IgnitionResource};
 use k8s_openapi::api::core::v1::{Node, ObjectReference, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use k8s_openapi::{ByteString, api::apps::v1::Deployment};
-use kube::api::{ListParams, ObjectMeta};
+use kube::api::{ListParams, ObjectMeta, Patch};
 use kube::{Api, core::Expression, runtime::wait::await_condition};
+use serde_json::json;
 use std::{collections::BTreeMap, time::Duration};
-use tokio::time::timeout;
+use tokio::{process::Command, time::timeout};
 use trusted_cluster_operator_lib::endpoints::*;
 use trusted_cluster_operator_test_utils::virt::{NodeBackend, sh_exec};
 use trusted_cluster_operator_test_utils::*;
@@ -103,11 +104,11 @@ struct OpenShiftNode {
 #[async_trait::async_trait]
 impl NodeBackend for OpenShiftNode {
     async fn ssh_exec(&self, command: &str) -> Result<String> {
-        let full_cmd = format!(
-            "oc debug node/{} -- nsenter -a -t 1 sh -c '{command}'",
-            self.node_name,
-        );
-        sh_exec(&full_cmd).await
+        let mut cmd = Command::new("oc");
+        cmd.args(["debug", &format!("node/{}", self.node_name)]);
+        cmd.args(["-n", "default", "--", "nsenter", "-at1"]);
+        cmd.args(["sh", "-c", command]);
+        sh_exec(&mut cmd).await
     }
 }
 
@@ -203,11 +204,10 @@ fn add_register_server(
     Ok(())
 }
 
-async fn extend_ign_secret(test_ctx: &TestContext, machine_name: &str) -> Result<String> {
+async fn extend_ign_secret(test_ctx: &TestContext, existing_secret_name: &str) -> Result<String> {
     let client = test_ctx.client();
     let ns = test_ctx.namespace();
     let secrets: Api<Secret> = Api::namespaced(client.clone(), MAPI_NS);
-    let existing_secret_name = format!("{machine_name}-user-data-managed");
     let existing_secret = secrets.get(&existing_secret_name).await?;
 
     let user_data_key = "userData";
@@ -223,7 +223,7 @@ async fn extend_ign_secret(test_ctx: &TestContext, machine_name: &str) -> Result
     add_register_server(&mut user_data, reg_server_addr, root_pem)?;
     let json = ByteString(serde_json::to_vec(&user_data)?);
 
-    let new_secret_name = format!("{machine_name}-cocl-user-data-managed");
+    let new_secret_name = format!("{existing_secret_name}-cocl");
     let secret = Secret {
         metadata: ObjectMeta {
             name: Some(new_secret_name.clone()),
@@ -244,26 +244,31 @@ async fn extend_ign_secret(test_ctx: &TestContext, machine_name: &str) -> Result
 
 fn adapt_machineset(
     mset: &mut MachineSet,
-    machine_name: &str,
+    machineset_name: &str,
     ign_secret_name: String,
 ) -> Result<()> {
     let mset_name = mset.metadata.name.clone().unwrap();
     mset.metadata = ObjectMeta {
-        name: Some(machine_name.to_string()),
+        name: Some(machineset_name.to_string()),
         ..Default::default()
     };
     mset.spec.replicas = Some(0);
 
     // TODO once test works, check if these are all necessary
     let mset_labels = mset.metadata.labels.get_or_insert_default();
-    mset_labels.insert(MACHINESET_LABEL.to_string(), machine_name.to_string());
+    mset_labels.insert(MACHINESET_LABEL.to_string(), machineset_name.to_string());
     let mset_selector = mset.spec.selector.get_or_insert_default();
     let mset_match_labels = mset_selector.match_labels.get_or_insert_default();
-    mset_match_labels.insert(MACHINESET_LABEL.to_string(), machine_name.to_string());
+    mset_match_labels.insert(MACHINESET_LABEL.to_string(), machineset_name.to_string());
     let mset_template = mset.spec.template.get_or_insert_default();
     let mset_template_meta = mset_template.metadata.get_or_insert_default();
     let mset_template_labels = mset_template_meta.labels.get_or_insert_default();
-    mset_template_labels.insert(MACHINESET_LABEL.to_string(), machine_name.to_string());
+    mset_template_labels.insert(MACHINESET_LABEL.to_string(), machineset_name.to_string());
+    let mset_template_spec = mset_template.spec.get_or_insert_default();
+    let mset_template_spec_meta = mset_template_spec.metadata.get_or_insert_default();
+    let mset_template_spec_labels = mset_template_spec_meta.labels.get_or_insert_default();
+    let node_label = format!("{NODE_ROLE_PREFIX}{machineset_name}");
+    mset_template_spec_labels.insert(node_label, String::new());
 
     let mset_spec = mset_template.spec.get_or_insert_default();
     let raw_mset_provider_spec = mset_spec.provider_spec.get_or_insert_default();
@@ -278,7 +283,7 @@ fn adapt_machineset(
 }
 
 struct ScaleContext {
-    machine_name: String,
+    machineset_name: String,
     mc_name: String,
     test_ctx: TestContext,
 }
@@ -287,16 +292,16 @@ impl ScaleContext {
     async fn new(test_ctx: TestContext) -> Result<Self> {
         let client = test_ctx.client();
         let ns = test_ctx.namespace();
-        let machine_name = format!("worker-cvm-{ns}");
-        let mc_name = format!("99-{machine_name}");
+        let machineset_name = format!("worker-cvm-{ns}");
+        let mc_name = format!("99-{machineset_name}");
 
         let bootc_image = get_env(BOOTC_IMAGE_ENV)?;
         let mc = MachineConfig {
             metadata: ObjectMeta {
                 name: Some(mc_name.clone()),
                 labels: Some(BTreeMap::from([
-                    (MAPI_ROLE.to_string(), machine_name.clone()),
-                    (MACHINESET_LABEL.to_string(), machine_name.clone()),
+                    (MAPI_ROLE.to_string(), machineset_name.clone()),
+                    (MACHINESET_LABEL.to_string(), machineset_name.clone()),
                 ])),
                 ..Default::default()
             },
@@ -308,9 +313,12 @@ impl ScaleContext {
         let machineconfigs: Api<MachineConfig> = Api::all(client.clone());
         test_ctx.info("Creating MachineConfig to override upgrade image");
         machineconfigs.create(&Default::default(), &mc).await?;
+        create_mcp(&test_ctx, &machineset_name, &mc_name).await?;
 
-        create_mcp(&test_ctx, &machine_name, &mc_name).await?;
-        let ign_secret_name = extend_ign_secret(&test_ctx, &machine_name).await?;
+        let existing_secret_name = format!("{machineset_name}-user-data-managed");
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), MAPI_NS);
+        wait_for_resource_created(&secrets, &existing_secret_name, scaled_timeout(120)).await?;
+        let cocl_ign_secret_name = extend_ign_secret(&test_ctx, &existing_secret_name).await?;
 
         let machinesets: Api<MachineSet> = Api::namespaced(client.clone(), MAPI_NS);
         let sel = Expression::Equal(MACHINEROLE_LABEL.to_string(), "worker".to_string());
@@ -319,14 +327,14 @@ impl ScaleContext {
         let ctx = "No existing worker machinesets found";
         let mut mset = existing_msets.items.first().context(ctx)?.clone();
         let mset_name = mset.metadata.name.clone().unwrap();
-        adapt_machineset(&mut mset, &machine_name, ign_secret_name)?;
+        adapt_machineset(&mut mset, &machineset_name, cocl_ign_secret_name)?;
 
-        let info = format!("Creating MachineSet {machine_name}, derived from {mset_name}");
+        let info = format!("Creating MachineSet {machineset_name}, derived from {mset_name}");
         test_ctx.info(info);
         machinesets.create(&Default::default(), &mset).await?;
 
         Ok(Self {
-            machine_name,
+            machineset_name,
             mc_name,
             test_ctx,
         })
@@ -340,40 +348,65 @@ impl ScaleContext {
         };
 
         let machinesets: Api<MachineSet> = Api::namespaced(self.test_ctx.client().clone(), MAPI_NS);
-        let machine_name = &self.machine_name;
-        let replicas_ready = await_condition(machinesets, machine_name, has_replicas);
-        let ctx = format!("MachineSet {machine_name} did not have desired replicas",);
+        let machineset_name = &self.machineset_name;
+        let replicas_ready = await_condition(machinesets, machineset_name, has_replicas);
+
+        let info = format!("Waiting for MachineSet {machineset_name} to have {replicas} replicas");
+        self.test_ctx.info(info);
+        let ctx = format!("MachineSet {machineset_name} did not have desired replicas",);
         timeout(duration, replicas_ready).await.context(ctx)??;
         self.test_ctx.info(format!(
-            "MachineSet {machine_name} achieved desired number of replicas ({replicas})"
+            "MachineSet {machineset_name} achieved desired number of replicas ({replicas})"
         ));
 
         Ok(())
     }
 
+    async fn scale_machineset(&self, count: u32) -> Result<()> {
+        let machinesets: Api<MachineSet> = Api::namespaced(self.test_ctx.client().clone(), MAPI_NS);
+        let patch = Patch::Merge(json!({
+            "spec": {
+                "replicas": count
+            }
+        }));
+        self.test_ctx
+            .info(format!("Updating MachineSet replicas to {count}"));
+        machinesets
+            .patch(&self.machineset_name, &Default::default(), &patch)
+            .await?;
+        Ok(())
+    }
+
     async fn cleanup(self) -> Result<()> {
         let client = self.test_ctx.client();
-        let machine_name = &self.machine_name;
+        let machineset_name = &self.machineset_name;
+        let secret_name = format!("{machineset_name}-user-data-managed-cocl");
 
         self.test_ctx.info("Cleaning up");
         let machinesets: Api<MachineSet> = Api::namespaced(client.clone(), MAPI_NS);
         let machineconfigs: Api<MachineConfig> = Api::all(client.clone());
         let mcps: Api<MachineConfigPool> = Api::all(client.clone());
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), MAPI_NS);
 
         let dp = Default::default();
-        machinesets.delete(machine_name, &dp).await?;
+        machinesets.delete(machineset_name, &dp).await?;
         machineconfigs.delete(&self.mc_name, &dp).await?;
-        mcps.delete(machine_name, &dp).await?;
+        mcps.delete(machineset_name, &dp).await?;
+        secrets.delete(&secret_name, &dp).await?;
         let duration = scaled_timeout(60);
-        wait_for_resource_deleted(&machinesets, machine_name, duration).await?;
+        wait_for_resource_deleted(&machinesets, machineset_name, duration).await?;
         self.test_ctx
-            .info(format!("MachineSet {machine_name} has been deleted"));
+            .info(format!("MachineSet {machineset_name} has been deleted"));
         wait_for_resource_deleted(&machineconfigs, &self.mc_name, duration).await?;
         self.test_ctx
             .info(format!("MachineConfig {} has been deleted", self.mc_name));
         wait_for_resource_deleted(&mcps, &self.mc_name, duration).await?;
+        self.test_ctx.info(format!(
+            "MachineConfigPool {machineset_name} has been deleted"
+        ));
+        wait_for_resource_deleted(&secrets, &secret_name, duration).await?;
         self.test_ctx
-            .info(format!("MachineConfigPool {machine_name} has been deleted",));
+            .info(format!("Secret {secret_name} has been deleted"));
 
         self.test_ctx.cleanup().await
     }
@@ -383,34 +416,34 @@ named_test!(
     async fn test_scale() -> anyhow::Result<()> {
         let test_ctx = setup!().await?;
         let scale_ctx = ScaleContext::new(test_ctx.clone()).await?;
-        let machine_name = &scale_ctx.machine_name;
 
-        let machinesets: Api<MachineSet> = Api::namespaced(test_ctx.client().clone(), MAPI_NS);
-        let mut mset = machinesets.get(machine_name).await?;
-        mset.spec.replicas = Some(1);
-        test_ctx.info("Updating MachineSet replicas to 1");
-        let rp = Default::default();
-        machinesets.replace(machine_name, &rp, &mset).await?;
-        scale_ctx.has_replicas(1, scaled_duration(300)).await?;
+        scale_ctx.scale_machineset(1).await?;
+        scale_ctx.has_replicas(1, scaled_duration(900)).await?;
 
-        let label = format!("{NODE_ROLE_PREFIX}{machine_name}");
-        let nodes: Api<Node> = Api::all(test_ctx.client().clone());
+        let machineset_name = &scale_ctx.machineset_name;
+        let machines: Api<Machine> = Api::namespaced(test_ctx.client().clone(), MAPI_NS);
+        let label = format!("{MACHINESET_LABEL}={machineset_name}");
         let lp = ListParams::default().labels(&label);
-        let node_list = nodes.list(&lp).await?;
-        assert!(!node_list.items.is_empty(), "No nodes found for MachineSet");
-        for node in &node_list.items {
-            let node_name = node.metadata.name.as_ref().unwrap();
-            let backend = OpenShiftNode {
-                node_name: node_name.clone(),
-            };
-            test_ctx.info(format!("Verifying encrypted root on node {node_name}"));
-            let ns = test_ctx.namespace();
-            let root_key = backend.get_root_key(test_ctx.client().clone(), ns).await?;
-            let has_encrypted_root = backend.verify_encrypted_root(root_key.as_deref()).await?;
-            let err = format!("Node {node_name} should have an encrypted root device");
-            assert!(has_encrypted_root, "{err}");
-            test_ctx.info(format!("Node {node_name}: encrypted root verified"));
-        }
+        let machines_list = machines.list(&lp).await?;
+        let ctx = format!("No machines found for MachineSet {machineset_name}");
+        let machine = machines_list.items.first().context(ctx)?;
+        let ctx = format!("Machine of MachineSet {machineset_name} had no name");
+        let machine_name = machine.metadata.name.as_ref().context(ctx)?;
+
+        let nodes: Api<Node> = Api::all(test_ctx.client().clone());
+        let node = nodes.get(&machine_name).await?;
+        let node_name = node.metadata.name.as_ref().unwrap();
+        let backend = OpenShiftNode {
+            node_name: node_name.clone(),
+        };
+        test_ctx.info(format!("Verifying encrypted root on node {node_name}"));
+        let ns = test_ctx.namespace();
+        let root_key = backend.get_root_key(test_ctx.client().clone(), ns).await?;
+        backend
+            .verify_encrypted_root(&root_key)
+            .await
+            .context("Node {node_name} should have an encrypted root device")?;
+        test_ctx.info(format!("Node {node_name}: encrypted root verified"));
 
         scale_ctx.cleanup().await
     }
@@ -421,14 +454,8 @@ named_test!(
         let test_ctx = setup!().await?;
         let scale_ctx = ScaleContext::new(test_ctx.clone()).await?;
 
-        let machinesets: Api<MachineSet> = Api::namespaced(test_ctx.client().clone(), MAPI_NS);
-        let mut mset = machinesets.get(&scale_ctx.machine_name).await?;
-        mset.spec.replicas = Some(2);
-        test_ctx.info("Updating MachineSet replicas to 2");
-        machinesets
-            .replace(&scale_ctx.machine_name, &Default::default(), &mset)
-            .await?;
-        scale_ctx.has_replicas(2, scaled_duration(300)).await?;
+        scale_ctx.scale_machineset(2).await?;
+        scale_ctx.has_replicas(2, scaled_duration(900)).await?;
         scale_ctx.cleanup().await
     }
 );
@@ -437,21 +464,10 @@ named_test!(
     async fn test_operator_restart() -> anyhow::Result<()> {
         let test_ctx = setup!().await?;
         let scale_ctx = ScaleContext::new(test_ctx.clone()).await?;
-        scale_ctx.has_replicas(1, scaled_duration(300)).await?;
-        let machine_name = &scale_ctx.machine_name;
 
-        let machinesets: Api<MachineSet> = Api::namespaced(test_ctx.client().clone(), MAPI_NS);
-        let mut mset = machinesets.get(&scale_ctx.machine_name).await?;
-        let rp = Default::default();
-
-        mset.spec.replicas = Some(1);
-        test_ctx.info("Updating MachineSet replicas to 1");
-        machinesets.replace(machine_name, &rp, &mset).await?;
-        scale_ctx.has_replicas(0, scaled_duration(60)).await?;
-
-        mset.spec.replicas = Some(0);
-        test_ctx.info("Updating MachineSet replicas to 0");
-        machinesets.replace(machine_name, &rp, &mset).await?;
+        scale_ctx.scale_machineset(1).await?;
+        scale_ctx.has_replicas(1, scaled_duration(900)).await?;
+        scale_ctx.scale_machineset(0).await?;
         scale_ctx.has_replicas(0, scaled_duration(60)).await?;
 
         test_ctx.info("Restarting trusted-cluster-operator");
@@ -459,10 +475,8 @@ named_test!(
             Api::namespaced(test_ctx.client().clone(), test_ctx.namespace());
         deployments.restart("trusted-cluster-operator").await?;
 
-        test_ctx.info("Updating MachineSet replicas back to 1");
-        mset.spec.replicas = Some(1);
-        machinesets.replace(machine_name, &rp, &mset).await?;
-        scale_ctx.has_replicas(1, scaled_duration(300)).await?;
+        scale_ctx.scale_machineset(1).await?;
+        scale_ctx.has_replicas(1, scaled_duration(900)).await?;
 
         scale_ctx.cleanup().await
     }

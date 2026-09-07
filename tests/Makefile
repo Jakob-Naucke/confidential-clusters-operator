@@ -27,7 +27,7 @@ trusted-cluster-gen-downstream: $(MAKEFILE_DIR)api/trusted-cluster-gen.go
 
 generate-downstream: $(CONTROLLER_GEN) $(OPENSHIFT_API_LOCAL)
 	$(call controller-gen,github.com/openshift/api/machineconfiguration/v1,*machineconfig{s$(comma)pools}*)
-	$(call controller-gen,./$(OPENSHIFT_API_LOCAL)/machine/v1beta1,*{machinesets$(comma)azure*specs}*)
+	$(call controller-gen,./$(OPENSHIFT_API_LOCAL)/machine/v1beta1,*{machines$(comma)azure*specs}*)
 
 crds-rs-downstream: generate-downstream $(KOPIUM) $(CRD_RS_PATH)
 	cd $(MAKEFILE_DIR) && $(MAKE) crds-rs

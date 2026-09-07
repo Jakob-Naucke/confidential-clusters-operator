@@ -5,4 +5,5 @@
 pub mod azuremachineproviderspecs;
 pub mod machineconfigpools;
 pub mod machineconfigs;
+pub mod machines;
 pub mod machinesets;
