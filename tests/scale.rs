@@ -13,7 +13,8 @@ use kube::{Api, core::Expression, runtime::wait::await_condition};
 use serde_json::json;
 use std::{collections::BTreeMap, time::Duration};
 use tokio::{process::Command, time::timeout};
-use trusted_cluster_operator_lib::endpoints::*;
+use trusted_cluster_operator_lib::reference_values::*;
+use trusted_cluster_operator_lib::{ApprovedImage, endpoints::*};
 use trusted_cluster_operator_test_utils::virt::{NodeBackend, sh_exec};
 use trusted_cluster_operator_test_utils::*;
 
@@ -107,6 +108,11 @@ impl NodeBackend for OpenShiftNode {
         cmd.args(["sh", "-c", command]);
         sh_exec(&mut cmd).await
     }
+}
+
+fn get_approved_image(machineconfig_name: &str) -> Result<String> {
+    let image_base = format!("{}-{}", machineconfig_name, get_env("APPROVED_IMAGE")?);
+    rfc1035(&image_base, OSIMAGE_RESOURCE_PREFIX)
 }
 
 fn create_mcp_object(machineset_name: &str) -> MachineConfigPool {
@@ -300,7 +306,7 @@ impl ScaleContext {
                 ..Default::default()
             },
             spec: MachineConfigSpec {
-                os_image_url: Some(bootc_image),
+                os_image_url: Some(bootc_image.clone()),
                 ..Default::default()
             },
         };
@@ -308,6 +314,13 @@ impl ScaleContext {
         test_ctx.info("Creating MachineConfig to override upgrade image");
         machineconfigs.create(&Default::default(), &mc).await?;
         create_mcp(&test_ctx, &machineset_name, &mc_name).await?;
+
+        let approved_image_name = get_approved_image(&mc_name)?;
+        let images: Api<ApprovedImage> = Api::namespaced(client.clone(), test_ctx.namespace());
+        let info = format!("Waiting for ApprovedImage {approved_image_name} to be Committed");
+        test_ctx.info(&info);
+        let done = await_condition(images, &approved_image_name, image_ready);
+        timeout(scaled_duration(300), done).await.context(info)??;
 
         let existing_secret_name = format!("{machineset_name}-user-data-managed");
         let secrets: Api<Secret> = Api::namespaced(client.clone(), MAPI_NS);
@@ -381,6 +394,8 @@ impl ScaleContext {
         let machineconfigs: Api<MachineConfig> = Api::all(client.clone());
         let mcps: Api<MachineConfigPool> = Api::all(client.clone());
         let secrets: Api<Secret> = Api::namespaced(client.clone(), MAPI_NS);
+        let approvedimages: Api<ApprovedImage> =
+            Api::namespaced(client.clone(), self.test_ctx.namespace());
 
         let dp = Default::default();
         machinesets.delete(machineset_name, &dp).await?;
@@ -401,6 +416,11 @@ impl ScaleContext {
         wait_for_resource_deleted(&secrets, &secret_name, duration).await?;
         self.test_ctx
             .info(format!("Secret {secret_name} has been deleted"));
+
+        let image_name = get_approved_image(&self.mc_name)?;
+        wait_for_resource_deleted(&approvedimages, &image_name, duration).await?;
+        self.test_ctx
+            .info(format!("ApprovedImage {image_name} has been deleted"));
 
         self.test_ctx.cleanup().await
     }
