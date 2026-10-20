@@ -37,4 +37,4 @@ crds-rs-downstream: generate-downstream $(KOPIUM) $(CRD_RS_PATH)
 INTEGRATION_TEST_FLAGS = -- --nocapture --test-threads=$(INTEGRATION_TEST_THREADS)
 scale-tests: crds-rs-downstream trusted-cluster-gen-downstream
 	UPSTREAM_DIR=$$(realpath ../operator) PLATFORM=openshift $(INTEGRATION_TEST_ENV) \
-	cargo test --test scale $(INTEGRATION_TEST_FLAGS)
+	cargo test --test scale $(INTEGRATION_TEST_FLAGS) test_scale
