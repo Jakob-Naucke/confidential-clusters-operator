@@ -4,6 +4,7 @@
   "ignorePaths": [
     "drift-cache"
   ],
+  "cloneSubmodules": true,
   "dockerfile": {
     "enabled": false
   },
