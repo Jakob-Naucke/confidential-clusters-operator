@@ -387,7 +387,7 @@ impl ScaleContext {
         machineconfigs.delete(&self.mc_name, &dp).await?;
         mcps.delete(machineset_name, &dp).await?;
         secrets.delete(&secret_name, &dp).await?;
-        let duration = scaled_timeout(60);
+        let duration = scaled_duration(60);
         wait_for_resource_deleted(&machinesets, machineset_name, duration).await?;
         self.test_ctx
             .info(format!("MachineSet {machineset_name} has been deleted"));

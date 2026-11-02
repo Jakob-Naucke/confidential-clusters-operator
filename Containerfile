@@ -15,6 +15,7 @@ FROM quay.io/konflux-ci/operator-sdk-builder:latest AS operator-sdk
 FROM registry.redhat.io/confidential-clusters-beta/buildroot-rhel9@sha256:84c4e5a2bb4f761d77dee1bc51894c1d43449b4f3d4b54f2fb784f90d3bc821f AS builder
 LABEL project=trusted-cluster-operator
 ARG build_type
+ENV OPENSSL_NO_VENDOR=1
 WORKDIR /build
 
 # Drift detection - ensure local build matches upstream
