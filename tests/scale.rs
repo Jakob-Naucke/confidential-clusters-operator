@@ -26,6 +26,7 @@ const MACHINEROLE_LABEL: &str = "machine.openshift.io/cluster-api-machine-role";
 const NODE_ROLE_PREFIX: &str = "node-role.kubernetes.io/";
 
 const AZURE_RESOURCE_ENV: &str = "AZURE_RESOURCE_ID";
+const BOOTC_IMAGE_ENV: &str = "BOOTC_IMAGE";
 
 trait TeePlatform {
     fn add_tee_options(
@@ -111,7 +112,7 @@ impl NodeBackend for OpenShiftNode {
 }
 
 fn get_approved_image(machineconfig_name: &str) -> Result<String> {
-    let image_base = format!("{}-{}", machineconfig_name, get_env("APPROVED_IMAGE")?);
+    let image_base = format!("{}-{}", machineconfig_name, get_env(BOOTC_IMAGE_ENV)?);
     rfc1035(&image_base, OSIMAGE_RESOURCE_PREFIX)
 }
 
@@ -297,7 +298,7 @@ impl ScaleContext {
         let machineset_name = format!("worker-cvm-{ns}");
         let mc_name = format!("99-{machineset_name}");
 
-        let bootc_image = get_env("APPROVED_IMAGE")?;
+        let bootc_image = get_env(BOOTC_IMAGE_ENV)?;
         let mc = MachineConfig {
             metadata: ObjectMeta {
                 name: Some(mc_name.clone()),
