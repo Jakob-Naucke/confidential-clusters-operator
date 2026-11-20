@@ -3,6 +3,11 @@
   "extends": [
     "schedule:weekly"
   ],
+  "lockFileMaintenance": {
+    "extends": [
+      "schedule:weekly"
+    ]
+  },
   "rebaseWhen": "conflicted",
   "ignorePaths": [
     "drift-cache"
